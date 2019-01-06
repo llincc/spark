@@ -33,9 +33,9 @@ from pyspark.accumulators import Accumulator
 from pyspark.broadcast import Broadcast, BroadcastPickleRegistry
 from pyspark.conf import SparkConf
 from pyspark.files import SparkFiles
-from pyspark.java_gateway import launch_gateway
+from pyspark.java_gateway import launch_gateway, local_connect_and_auth
 from pyspark.serializers import PickleSerializer, BatchedSerializer, UTF8Deserializer, \
-    PairDeserializer, AutoBatchedSerializer, NoOpSerializer
+    PairDeserializer, AutoBatchedSerializer, NoOpSerializer, ChunkedStream
 from pyspark.storagelevel import StorageLevel
 from pyspark.rdd import RDD, _load_from_socket, ignore_unicode_prefix
 from pyspark.traceback_utils import CallSite, first_spark_call
@@ -112,6 +112,20 @@ class SparkContext(object):
         ValueError:...
         """
         self._callsite = first_spark_call() or CallSite(None, None, None)
+        if gateway is not None and gateway.gateway_parameters.auth_token is None:
+            allow_insecure_env = os.environ.get("PYSPARK_ALLOW_INSECURE_GATEWAY", "0")
+            if allow_insecure_env == "1" or allow_insecure_env.lower() == "true":
+                warnings.warn(
+                    "You are passing in an insecure Py4j gateway.  This "
+                    "presents a security risk, and will be completely forbidden in Spark 3.0")
+            else:
+                raise ValueError(
+                    "You are trying to pass an insecure Py4j gateway to Spark. This"
+                    " presents a security risk.  If you are sure you understand and accept this"
+                    " risk, you can set the environment variable"
+                    " 'PYSPARK_ALLOW_INSECURE_GATEWAY=1', but"
+                    " note this option will be removed in Spark 3.0")
+
         SparkContext._ensure_initialized(self, gateway=gateway, conf=conf)
         try:
             self._do_init(master, appName, sparkHome, pyFiles, environment, batchSize, serializer,
@@ -183,10 +197,16 @@ class SparkContext(object):
 
         # Create a single Accumulator in Java that we'll send all our updates through;
         # they will be passed back to us through a TCP server
-        self._accumulatorServer = accumulators._start_update_server()
+        auth_token = self._gateway.gateway_parameters.auth_token
+        self._accumulatorServer = accumulators._start_update_server(auth_token)
         (host, port) = self._accumulatorServer.server_address
-        self._javaAccumulator = self._jvm.PythonAccumulatorV2(host, port)
+        self._javaAccumulator = self._jvm.PythonAccumulatorV2(host, port, auth_token)
         self._jsc.sc().register(self._javaAccumulator)
+
+        # If encryption is enabled, we need to setup a server in the jvm to read broadcast
+        # data via a socket.
+        # scala's mangled names w/ $ in them require special treatment.
+        self._encryption_enabled = self._jvm.PythonUtils.getEncryptionEnabled(self._jsc)
 
         self.pythonExec = os.environ.get("PYSPARK_PYTHON", 'python')
         self.pythonVer = "%d.%d" % sys.version_info[:2]
@@ -498,19 +518,31 @@ class SparkContext(object):
 
     def _serialize_to_jvm(self, data, parallelism, serializer):
         """
-        Calling the Java parallelize() method with an ArrayList is too slow,
-        because it sends O(n) Py4J commands.  As an alternative, serialized
-        objects are written to a file and loaded through textFile().
+        Using py4j to send a large dataset to the jvm is really slow, so we use either a file
+        or a socket if we have encryption enabled.
         """
-        tempFile = NamedTemporaryFile(delete=False, dir=self._temp_dir)
-        try:
-            serializer.dump_stream(data, tempFile)
-            tempFile.close()
-            readRDDFromFile = self._jvm.PythonRDD.readRDDFromFile
-            return readRDDFromFile(self._jsc, tempFile.name, parallelism)
-        finally:
-            # readRDDFromFile eagerily reads the file so we can delete right after.
-            os.unlink(tempFile.name)
+        if self._encryption_enabled:
+            # with encryption, we open a server in java and send the data directly
+            server = self._jvm.PythonParallelizeServer(self._jsc.sc(), parallelism)
+            (sock_file, _) = local_connect_and_auth(server.port(), server.secret())
+            chunked_out = ChunkedStream(sock_file, 8192)
+            serializer.dump_stream(data, chunked_out)
+            chunked_out.close()
+            # this call will block until the server has read all the data and processed it (or
+            # throws an exception)
+            return server.getResult()
+        else:
+            # without encryption, we serialize to a file, and we read the file in java and
+            # parallelize from there.
+            tempFile = NamedTemporaryFile(delete=False, dir=self._temp_dir)
+            try:
+                serializer.dump_stream(data, tempFile)
+                tempFile.close()
+                readRDDFromFile = self._jvm.PythonRDD.readRDDFromFile
+                return readRDDFromFile(self._jsc, tempFile.name, parallelism)
+            finally:
+                # we eagerly read the file so we can delete right after.
+                os.unlink(tempFile.name)
 
     def pickleFile(self, name, minPartitions=None):
         """
