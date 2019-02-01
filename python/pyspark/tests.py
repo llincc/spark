@@ -61,6 +61,7 @@ else:
 from pyspark import keyword_only
 from pyspark.conf import SparkConf
 from pyspark.context import SparkContext
+from pyspark.java_gateway import _launch_gateway
 from pyspark.rdd import RDD
 from pyspark.files import SparkFiles
 from pyspark.serializers import read_int, BatchedSerializer, MarshalSerializer, PickleSerializer, \
@@ -160,6 +161,37 @@ class MergerTests(unittest.TestCase):
         for k, vs in l:
             self.assertEqual(k, len(vs))
             self.assertEqual(list(range(k)), list(vs))
+
+    def test_stopiteration_is_raised(self):
+
+        def stopit(*args, **kwargs):
+            raise StopIteration()
+
+        def legit_create_combiner(x):
+            return [x]
+
+        def legit_merge_value(x, y):
+            return x.append(y) or x
+
+        def legit_merge_combiners(x, y):
+            return x.extend(y) or x
+
+        data = [(x % 2, x) for x in range(100)]
+
+        # wrong create combiner
+        m = ExternalMerger(Aggregator(stopit, legit_merge_value, legit_merge_combiners), 20)
+        with self.assertRaises((Py4JJavaError, RuntimeError)) as cm:
+            m.mergeValues(data)
+
+        # wrong merge value
+        m = ExternalMerger(Aggregator(legit_create_combiner, stopit, legit_merge_combiners), 20)
+        with self.assertRaises((Py4JJavaError, RuntimeError)) as cm:
+            m.mergeValues(data)
+
+        # wrong merge combiners
+        m = ExternalMerger(Aggregator(legit_create_combiner, legit_merge_value, stopit), 20)
+        with self.assertRaises((Py4JJavaError, RuntimeError)) as cm:
+            m.mergeCombiners(map(lambda x_y1: (x_y1[0], [x_y1[1]]), data))
 
 
 class SorterTests(unittest.TestCase):
@@ -1239,6 +1271,35 @@ class RDDTests(ReusedPySparkTestCase):
         self.assertRaises(Py4JJavaError, rdd.pipe('grep 4', checkCode=True).collect)
         self.assertEqual([], rdd.pipe('grep 4').collect())
 
+    def test_stopiteration_in_user_code(self):
+
+        def stopit(*x):
+            raise StopIteration()
+
+        seq_rdd = self.sc.parallelize(range(10))
+        keyed_rdd = self.sc.parallelize((x % 2, x) for x in range(10))
+        msg = "Caught StopIteration thrown from user's code; failing the task"
+
+        self.assertRaisesRegexp(Py4JJavaError, msg, seq_rdd.map(stopit).collect)
+        self.assertRaisesRegexp(Py4JJavaError, msg, seq_rdd.filter(stopit).collect)
+        self.assertRaisesRegexp(Py4JJavaError, msg, seq_rdd.foreach, stopit)
+        self.assertRaisesRegexp(Py4JJavaError, msg, seq_rdd.reduce, stopit)
+        self.assertRaisesRegexp(Py4JJavaError, msg, seq_rdd.fold, 0, stopit)
+        self.assertRaisesRegexp(Py4JJavaError, msg, seq_rdd.foreach, stopit)
+        self.assertRaisesRegexp(Py4JJavaError, msg,
+                                seq_rdd.cartesian(seq_rdd).flatMap(stopit).collect)
+
+        # these methods call the user function both in the driver and in the executor
+        # the exception raised is different according to where the StopIteration happens
+        # RuntimeError is raised if in the driver
+        # Py4JJavaError is raised if in the executor (wraps the RuntimeError raised in the worker)
+        self.assertRaisesRegexp((Py4JJavaError, RuntimeError), msg,
+                                keyed_rdd.reduceByKeyLocally, stopit)
+        self.assertRaisesRegexp((Py4JJavaError, RuntimeError), msg,
+                                seq_rdd.aggregate, 0, stopit, lambda *x: 1)
+        self.assertRaisesRegexp((Py4JJavaError, RuntimeError), msg,
+                                seq_rdd.aggregate, 0, lambda *x: 1, stopit)
+
 
 class ProfilerTests(PySparkTestCase):
 
@@ -2234,6 +2295,37 @@ class ContextTests(unittest.TestCase):
     def test_startTime(self):
         with SparkContext() as sc:
             self.assertGreater(sc.startTime, 0)
+
+    def test_forbid_insecure_gateway(self):
+        # By default, we fail immediately if you try to create a SparkContext
+        # with an insecure gateway
+        gateway = _launch_gateway(insecure=True)
+        log4j = gateway.jvm.org.apache.log4j
+        old_level = log4j.LogManager.getRootLogger().getLevel()
+        try:
+            log4j.LogManager.getRootLogger().setLevel(log4j.Level.FATAL)
+            with self.assertRaises(Exception) as context:
+                SparkContext(gateway=gateway)
+            self.assertIn("insecure Py4j gateway", str(context.exception))
+            self.assertIn("PYSPARK_ALLOW_INSECURE_GATEWAY", str(context.exception))
+            self.assertIn("removed in Spark 3.0", str(context.exception))
+        finally:
+            log4j.LogManager.getRootLogger().setLevel(old_level)
+
+    def test_allow_insecure_gateway_with_conf(self):
+        with SparkContext._lock:
+            SparkContext._gateway = None
+            SparkContext._jvm = None
+        gateway = _launch_gateway(insecure=True)
+        try:
+            os.environ["PYSPARK_ALLOW_INSECURE_GATEWAY"] = "1"
+            with SparkContext(gateway=gateway) as sc:
+                a = sc.accumulator(1)
+                rdd = sc.parallelize([1, 2, 3])
+                rdd.foreach(lambda x: a.add(x))
+                self.assertEqual(7, a.value)
+        finally:
+            os.environ.pop("PYSPARK_ALLOW_INSECURE_GATEWAY", None)
 
 
 class ConfTests(unittest.TestCase):

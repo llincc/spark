@@ -120,6 +120,13 @@ case class Not(child: Expression)
 
   override def inputTypes: Seq[DataType] = Seq(BooleanType)
 
+  // +---------+-----------+
+  // | CHILD   | NOT CHILD |
+  // +---------+-----------+
+  // | TRUE    | FALSE     |
+  // | FALSE   | TRUE      |
+  // | UNKNOWN | UNKNOWN   |
+  // +---------+-----------+
   protected override def nullSafeEval(input: Any): Any = !input.asInstanceOf[Boolean]
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
@@ -330,31 +337,26 @@ case class InSet(child: Expression, hset: Set[Any]) extends UnaryExpression with
   }
 
   @transient lazy val set: Set[Any] = child.dataType match {
-    case _: AtomicType => hset
+    case t: AtomicType if !t.isInstanceOf[BinaryType] => hset
     case _: NullType => hset
     case _ =>
       // for structs use interpreted ordering to be able to compare UnsafeRows with non-UnsafeRows
-      TreeSet.empty(TypeUtils.getInterpretedOrdering(child.dataType)) ++ hset
+      TreeSet.empty(TypeUtils.getInterpretedOrdering(child.dataType)) ++ (hset - null)
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    val setTerm = ctx.addReferenceObj("set", set)
-    val childGen = child.genCode(ctx)
-    val setIsNull = if (hasNull) {
-      s"${ev.isNull} = !${ev.value};"
-    } else {
-      ""
-    }
-    ev.copy(code =
+    nullSafeCodeGen(ctx, ev, c => {
+      val setTerm = ctx.addReferenceObj("set", set)
+      val setIsNull = if (hasNull) {
+        s"${ev.isNull} = !${ev.value};"
+      } else {
+        ""
+      }
       s"""
-         |${childGen.code}
-         |${ctx.JAVA_BOOLEAN} ${ev.isNull} = ${childGen.isNull};
-         |${ctx.JAVA_BOOLEAN} ${ev.value} = false;
-         |if (!${ev.isNull}) {
-         |  ${ev.value} = $setTerm.contains(${childGen.value});
-         |  $setIsNull
-         |}
-       """.stripMargin)
+         |${ev.value} = $setTerm.contains($c);
+         |$setIsNull
+       """.stripMargin
+    })
   }
 
   override def sql: String = {
@@ -374,6 +376,13 @@ case class And(left: Expression, right: Expression) extends BinaryOperator with 
 
   override def sqlOperator: String = "AND"
 
+  // +---------+---------+---------+---------+
+  // | AND     | TRUE    | FALSE   | UNKNOWN |
+  // +---------+---------+---------+---------+
+  // | TRUE    | TRUE    | FALSE   | UNKNOWN |
+  // | FALSE   | FALSE   | FALSE   | FALSE   |
+  // | UNKNOWN | UNKNOWN | FALSE   | UNKNOWN |
+  // +---------+---------+---------+---------+
   override def eval(input: InternalRow): Any = {
     val input1 = left.eval(input)
     if (input1 == false) {
@@ -437,6 +446,13 @@ case class Or(left: Expression, right: Expression) extends BinaryOperator with P
 
   override def sqlOperator: String = "OR"
 
+  // +---------+---------+---------+---------+
+  // | OR      | TRUE    | FALSE   | UNKNOWN |
+  // +---------+---------+---------+---------+
+  // | TRUE    | TRUE    | TRUE    | TRUE    |
+  // | FALSE   | TRUE    | FALSE   | UNKNOWN |
+  // | UNKNOWN | TRUE    | UNKNOWN | UNKNOWN |
+  // +---------+---------+---------+---------+
   override def eval(input: InternalRow): Any = {
     val input1 = left.eval(input)
     if (input1 == true) {
@@ -560,6 +576,13 @@ case class EqualTo(left: Expression, right: Expression)
 
   override def symbol: String = "="
 
+  // +---------+---------+---------+---------+
+  // | =       | TRUE    | FALSE   | UNKNOWN |
+  // +---------+---------+---------+---------+
+  // | TRUE    | TRUE    | FALSE   | UNKNOWN |
+  // | FALSE   | FALSE   | TRUE    | UNKNOWN |
+  // | UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN |
+  // +---------+---------+---------+---------+
   protected override def nullSafeEval(left: Any, right: Any): Any = ordering.equiv(left, right)
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
@@ -597,6 +620,13 @@ case class EqualNullSafe(left: Expression, right: Expression) extends BinaryComp
 
   override def nullable: Boolean = false
 
+  // +---------+---------+---------+---------+
+  // | <=>     | TRUE    | FALSE   | UNKNOWN |
+  // +---------+---------+---------+---------+
+  // | TRUE    | TRUE    | FALSE   | FALSE   |
+  // | FALSE   | FALSE   | TRUE    | FALSE   |
+  // | UNKNOWN | FALSE   | FALSE   | TRUE    |
+  // +---------+---------+---------+---------+
   override def eval(input: InternalRow): Any = {
     val input1 = left.eval(input)
     val input2 = right.eval(input)
