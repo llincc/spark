@@ -311,7 +311,7 @@ abstract class DStream[T: ClassTag] (
   private[streaming] def isTimeValid(time: Time): Boolean = {
     if (!isInitialized) {
       throw new SparkException (this + " has not been initialized")
-    } else if (time <= zeroTime || ! (time - zeroTime).isMultipleOf(slideDuration)) {
+    } else if (time <= zeroTime || ! (time - zeroTime).isMultipleOf(slideDuration)) {  //时间-zeroTime 是否是slideDuration的整数倍
       logInfo(s"Time $time is invalid as zeroTime is $zeroTime" +
         s" , slideDuration is $slideDuration and difference is ${time - zeroTime}")
       false
@@ -328,6 +328,7 @@ abstract class DStream[T: ClassTag] (
   private[streaming] final def getOrCompute(time: Time): Option[RDD[T]] = {
     // If RDD was already generated, then retrieve it from HashMap,
     // or else compute the RDD
+    //在RDD第一次被获取的时候，触发compute生成rdd，之后会命中get(time)
     generatedRDDs.get(time).orElse {
       // Compute the RDD if time is valid (e.g. correct time in a sliding window)
       // of RDD generation, else generate nothing.

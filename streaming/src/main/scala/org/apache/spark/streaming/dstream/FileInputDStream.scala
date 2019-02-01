@@ -145,13 +145,14 @@ class FileInputDStream[K, V, F <: NewInputFormat[K, V]](
    * the previous call.
    */
   override def compute(validTime: Time): Option[RDD[(K, V)]] = {
-    // Find new files
+    // Find new files 通过一个 findNewFiles() 方法，找到 validTime 以后产生的新 file 的数据
     val newFiles = findNewFiles(validTime.milliseconds)
     logInfo("New files at time " + validTime + ":\n" + newFiles.mkString("\n"))
     batchTimeToSelectedFiles.synchronized {
       batchTimeToSelectedFiles += ((validTime, newFiles))
     }
     recentlySelectedFiles ++= newFiles
+     // 找到了一些新 file；以新 file 的数组为参数，通过 filesToRDD() 生成单个 RDD 实例 rdds
     val rdds = Some(filesToRDD(newFiles))
     // Copy newFiles to immutable.List to prevent from being modified by the user
     val metadata = Map(
@@ -274,6 +275,7 @@ class FileInputDStream[K, V, F <: NewInputFormat[K, V]](
   /** Generate one RDD from an array of files */
   private def filesToRDD(files: Seq[String]): RDD[(K, V)] = {
     val fileRDDs = files.map { file =>
+      // 对每个 file，都 sc.newAPIHadoopFile(file) 来生成一个 RDD
       val rdd = serializableConfOpt.map(_.value) match {
         case Some(config) => context.sparkContext.newAPIHadoopFile(
           file,
@@ -290,6 +292,7 @@ class FileInputDStream[K, V, F <: NewInputFormat[K, V]](
       }
       rdd
     }
+    // 将每个 file 对应的 RDD 进行 union，返回一个 union 后的 UnionRDD
     new UnionRDD(context.sparkContext, fileRDDs)
   }
 
